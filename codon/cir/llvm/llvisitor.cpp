@@ -233,6 +233,7 @@ llvm::Function *LLVMVisitor::getFunc(const Func *func) {
             llvm::FunctionType::get(returnType, argTypes, funcType->isVariadic());
         auto *g = llvm::Function::Create(llvmFuncType, llvm::Function::ExternalLinkage,
                                          name, M.get());
+
         insertFunc(func, g);
         return g;
       }
@@ -247,12 +248,23 @@ llvm::Function *LLVMVisitor::getFunc(const Func *func) {
 
 std::unique_ptr<llvm::Module> LLVMVisitor::makeModule(llvm::LLVMContext &context,
                                                       const SrcInfo *src) {
+  auto triple = llvm::Triple("thumbv7em-none-eabi");
+
   auto builder = llvm::EngineBuilder();
-  builder.setMArch(llvm::codegen::getMArch());
+  //builder.setMArch(llvm::codegen::getMArch());
   builder.setMCPU(llvm::codegen::getCPUStr());
   builder.setMAttrs(llvm::codegen::getFeatureList());
 
-  auto target = builder.selectTarget();
+
+  llvm::SmallVector<std::string, 4> MAttrs;
+  MAttrs.push_back("+vfpv4-sp-d16");
+
+  auto target = builder.selectTarget(triple, llvm::codegen::getMArch(), llvm::codegen::getCPUStr(), MAttrs);
+
+  fmt::print(stdout, "target_triple->{}\n", target->getTargetTriple().str());
+  fmt::print(stdout, "mcpu->{}\n", llvm::codegen::getCPUStr());
+  fmt::print(stdout, "features->{}\n", llvm::codegen::getFeatureList());
+
   auto M = std::make_unique<llvm::Module>("codon", context);
   M->setTargetTriple(target->getTargetTriple().str());
   M->setDataLayout(target->createDataLayout());
@@ -387,7 +399,20 @@ void LLVMVisitor::writeToObjectFile(const std::string &filename, bool pic,
     compilationError(err.message());
   llvm::raw_pwrite_stream *os = &out->os();
 
+  fmt::print(stdout, "obj out {}", M->getTargetTriple());
+  
   auto machine = getTargetMachine(M.get(), /*setFunctionAttributes=*/false, pic);
+
+
+  fmt::print(stdout, "obj out {}\n", machine->getTargetCPU());
+  fmt::print(stdout, "obj out {}\n", machine->getTargetFeatureString());
+  fmt::print(stdout, "obj out hard {}\n", machine->Options.FloatABIType==llvm::FloatABI::Hard);
+  fmt::print(stdout, "obj out soft {}\n", machine->Options.FloatABIType==llvm::FloatABI::Soft);
+  fmt::print(stdout, "obj out default {}\n", machine->Options.FloatABIType==llvm::FloatABI::Default);
+  fmt::print(stdout, "obj out agg {}\n", machine->getOptLevel()==llvm::CodeGenOptLevel::Aggressive);
+
+
+
   auto *mmiwp = new llvm::MachineModuleInfoWrapperPass(machine.get());
   llvm::legacy::PassManager pm;
 
@@ -1438,7 +1463,43 @@ llvm::Value *LLVMVisitor::call(llvm::FunctionCallee callee,
                                llvm::ArrayRef<llvm::Value *> args) {
   B->SetInsertPoint(block);
   if ((trycatch.empty() && finally.empty()) || DisableExceptions) {
+    // === BEGIN PATCH: sret-aware runtime calls (LLVM 20 legacy) ===
+    llvm::Function *calleeFn =
+        llvm::dyn_cast<llvm::Function>(callee.getCallee());
+    std::string calleeName = calleeFn ? calleeFn->getName().str() : "";
+
+    static const std::set<std::string> sretWhitelist = {
+        "seq_str_int",
+        "seq_str_float",
+        "seq_str_ptr"
+        // add more if needed
+    };
+
+    bool isRuntimeSRet =
+        calleeFn &&
+        sretWhitelist.count(calleeName) > 0 &&
+        calleeFn->getFunctionType()->getReturnType()->isVoidTy() &&
+        calleeFn->hasParamAttribute(0, llvm::Attribute::StructRet);
+
+    if (isRuntimeSRet) {
+      // LLVM 20 has no typed sret attributes → hardcode Codon runtime struct
+      llvm::Type *resTy = llvm::StructType::get(
+          llvm::Type::getInt64Ty(M->getContext()),
+          llvm::PointerType::get(M->getContext(), 0));
+
+      llvm::Value *resAlloca = B->CreateAlloca(resTy);
+
+      std::vector<llvm::Value *> argsWithSRet;
+      argsWithSRet.reserve(args.size() + 1);
+      argsWithSRet.push_back(resAlloca);
+      argsWithSRet.insert(argsWithSRet.end(), args.begin(), args.end());
+
+      B->CreateCall(calleeFn, argsWithSRet);
+      return B->CreateLoad(resTy, resAlloca);
+    }
+
     return B->CreateCall(callee, args);
+    // === END PATCH ===
   } else {
     auto *normalBlock = llvm::BasicBlock::Create(*context, "invoke.normal", func);
     // use non-empty of finally-stack and try-stack, or whichever is most recent if both
@@ -1707,11 +1768,46 @@ llvm::Function *LLVMVisitor::makeLLVMFunction(const Func *x) {
     argTypes.push_back(getLLVMType(argType));
   }
 
+  const std::string functionName = getNameForFunction(x);
+
+  // === BEGIN PATCH: struct-return fix only for runtime functions ===
+  static const std::set<std::string> sretWhitelist = {
+      "seq_str_int",
+      "seq_str_float",
+      "seq_str_ptr"
+      // add more runtime struct-return functions here as needed
+  };
+
+  bool isRuntimeSRet =
+      sretWhitelist.count(functionName) > 0;
+
+  if (isRuntimeSRet) {
+    if (returnType->isStructTy()) {
+      argTypes.insert(argTypes.begin(), returnType->getPointerTo());
+      returnType = llvm::Type::getVoidTy(M->getContext());
+    }
+  }
+  // === END PATCH ===
+
   auto *llvmFuncType =
       llvm::FunctionType::get(returnType, argTypes, funcType->isVariadic());
-  const std::string functionName = getNameForFunction(x);
   auto *f = llvm::cast<llvm::Function>(
       M->getOrInsertFunction(functionName, llvmFuncType).getCallee());
+
+  // === BEGIN PATCH: typed sret attribute fix (LLVM 20 opaque pointers) ===
+  if (isRuntimeSRet && f->arg_size() > 0 &&
+      f->getFunctionType()->getReturnType()->isVoidTy()) {
+
+    // we can no longer get the element type from PointerType because all are opaque
+    llvm::Type *retTy = getLLVMType(funcType->getReturnType());
+
+    f->addParamAttr(
+        0,
+        llvm::Attribute::getWithStructRetType(M->getContext(), retTy));
+    f->addParamAttr(0, llvm::Attribute::NoAlias);
+  }
+  // === END PATCH ===
+
   if (!cast<ExternalFunc>(x)) {
     f->setSubprogram(getDISubprogramForFunc(x));
   }
@@ -1841,17 +1937,39 @@ void LLVMVisitor::visit(const InternalFunc *x) {
       result = B->CreateBitCast(ptr, baseType->getPointerTo());
     }
   }
-
+  // === BEGIN PATCH: handle sret record creation ===
   else if (internalFuncMatchesIgnoreArgs<RecordType>("__new__", x)) {
-    auto *recordType = cast<RecordType>(cast<FuncType>(x->getType())->getReturnType());
-    seqassertn(args.size() == std::distance(recordType->begin(), recordType->end()),
-               "args size does not match: {} vs {}", args.size(),
-               std::distance(recordType->begin(), recordType->end()));
-    result = llvm::UndefValue::get(getLLVMType(recordType));
-    for (auto i = 0; i < args.size(); i++) {
-      result = B->CreateInsertValue(result, args[i], i);
+    auto *recordType =
+        cast<RecordType>(cast<FuncType>(x->getType())->getReturnType());
+
+    unsigned numRecordFields =
+        std::distance(recordType->begin(), recordType->end());
+
+    // Allow one extra hidden sret pointer argument
+    bool hasSRet = (args.size() == numRecordFields + 1);
+
+    if (!hasSRet)
+      seqassertn(args.size() == numRecordFields,
+                "args size does not match: {} vs {}", args.size(),
+                numRecordFields);
+
+    if (hasSRet) {
+      // First argument is sret destination pointer
+      llvm::Value *destPtr = args[0];
+      for (unsigned i = 0; i < numRecordFields; ++i) {
+        auto *fieldPtr =
+            B->CreateStructGEP(getLLVMType(recordType), destPtr, i);
+        B->CreateStore(args[i + 1], fieldPtr);
+      }
+      result = destPtr;  // return the pointer for sret
+    } else {
+      result = llvm::UndefValue::get(getLLVMType(recordType));
+      for (unsigned i = 0; i < args.size(); ++i)
+        result = B->CreateInsertValue(result, args[i], i);
     }
   }
+  // === END PATCH ===
+
 
   seqassertn(result, "internal function {} not found", *x);
   B->CreateRet(result);
@@ -1998,14 +2116,25 @@ void LLVMVisitor::visit(const BodiedFunc *x) {
   seqassertn(funcType, "{} is not a function type", *x->getType());
   auto *returnType = funcType->getReturnType();
   auto *entryBlock = llvm::BasicBlock::Create(*context, "entry", func);
-  B->SetInsertPoint(entryBlock);
+  B->SetInsertPoint(entryBlock);  
 
-  // set up arguments and other symbols
-  seqassertn(std::distance(func->arg_begin(), func->arg_end()) ==
-                 std::distance(x->arg_begin(), x->arg_end()),
-             "argument length does not match");
+  // === BEGIN PATCH: skip sret argument for struct-return functions ===
+  unsigned numLLVMArgs = std::distance(func->arg_begin(), func->arg_end());
+  unsigned numCodonArgs = std::distance(x->arg_begin(), x->arg_end());
+
+  bool hasSRet = (numLLVMArgs == numCodonArgs + 1) &&
+                func->getFunctionType()->getReturnType()->isVoidTy() &&
+                func->hasParamAttribute(0, llvm::Attribute::StructRet);
+
+  if (!hasSRet)
+    seqassertn(numLLVMArgs == numCodonArgs, "argument length does not match");
+
   unsigned argIdx = 1;
   auto argIter = func->arg_begin();
+  if (hasSRet)
+    ++argIter; // skip hidden sret pointer
+  // === END PATCH ===
+
   for (auto varIter = x->arg_begin(); varIter != x->arg_end(); ++varIter) {
     const Var *var = *varIter;
     llvm::Value *storage = B->CreateAlloca(getLLVMType(var->getType()));
