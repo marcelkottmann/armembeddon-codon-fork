@@ -1463,30 +1463,17 @@ llvm::Value *LLVMVisitor::call(llvm::FunctionCallee callee,
                                llvm::ArrayRef<llvm::Value *> args) {
   B->SetInsertPoint(block);
   if ((trycatch.empty() && finally.empty()) || DisableExceptions) {
-    // === BEGIN PATCH: sret-aware runtime calls (LLVM 20 legacy) ===
+    // === BEGIN PATCH: sret-aware runtime calls ===
     llvm::Function *calleeFn =
         llvm::dyn_cast<llvm::Function>(callee.getCallee());
     std::string calleeName = calleeFn ? calleeFn->getName().str() : "";
-
-    static const std::set<std::string> sretWhitelist = {
-        "seq_str_int",
-        "seq_str_float",
-        "seq_str_ptr"
-        // add more if needed
-    };
-
     bool isRuntimeSRet =
         calleeFn &&
-        sretWhitelist.count(calleeName) > 0 &&
         calleeFn->getFunctionType()->getReturnType()->isVoidTy() &&
         calleeFn->hasParamAttribute(0, llvm::Attribute::StructRet);
 
     if (isRuntimeSRet) {
-      // LLVM 20 has no typed sret attributes → hardcode Codon runtime struct
-      llvm::Type *resTy = llvm::StructType::get(
-          llvm::Type::getInt64Ty(M->getContext()),
-          llvm::PointerType::get(M->getContext(), 0));
-
+      llvm::Type *resTy = sretTypes[calleeName];
       llvm::Value *resAlloca = B->CreateAlloca(resTy);
 
       std::vector<llvm::Value *> argsWithSRet;
@@ -1770,22 +1757,22 @@ llvm::Function *LLVMVisitor::makeLLVMFunction(const Func *x) {
 
   const std::string functionName = getNameForFunction(x);
 
-  // === BEGIN PATCH: struct-return fix only for runtime functions ===
-  static const std::set<std::string> sretWhitelist = {
-      "seq_str_int",
-      "seq_str_float",
-      "seq_str_ptr"
-      // add more runtime struct-return functions here as needed
-  };
+  // === BEGIN PATCH: struct-return fix ===
+  bool isExternal=isA<ExternalFunc>(x);
+  bool sretNeeded=false;
 
-  bool isRuntimeSRet =
-      sretWhitelist.count(functionName) > 0;
+  if (isExternal && returnType->isStructTy())              {
+    llvm::StructType* structTy = llvm::cast<llvm::StructType>(returnType);
+    const llvm::DataLayout& DL = M->getDataLayout();
+    const llvm::StructLayout* structLayout = DL.getStructLayout(structTy);
+    uint64_t structSizeInBytes = structLayout->getSizeInBytes();
+    sretNeeded = structSizeInBytes > 8;
+  }
 
-  if (isRuntimeSRet) {
-    if (returnType->isStructTy()) {
-      argTypes.insert(argTypes.begin(), returnType->getPointerTo());
-      returnType = llvm::Type::getVoidTy(M->getContext());
-    }
+  if (sretNeeded) {
+    sretTypes[functionName]=returnType;
+    argTypes.insert(argTypes.begin(), returnType->getPointerTo());
+    returnType = llvm::Type::getVoidTy(M->getContext());
   }
   // === END PATCH ===
 
@@ -1795,9 +1782,7 @@ llvm::Function *LLVMVisitor::makeLLVMFunction(const Func *x) {
       M->getOrInsertFunction(functionName, llvmFuncType).getCallee());
 
   // === BEGIN PATCH: typed sret attribute fix (LLVM 20 opaque pointers) ===
-  if (isRuntimeSRet && f->arg_size() > 0 &&
-      f->getFunctionType()->getReturnType()->isVoidTy()) {
-
+  if (sretNeeded) {
     // we can no longer get the element type from PointerType because all are opaque
     llvm::Type *retTy = getLLVMType(funcType->getReturnType());
 

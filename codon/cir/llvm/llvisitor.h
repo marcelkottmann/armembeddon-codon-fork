@@ -146,6 +146,7 @@ private:
   std::unordered_map<id_t, llvm::Value *> vars;
   /// LLVM functions corresponding to IR functions
   std::unordered_map<id_t, llvm::Function *> funcs;
+  std::unordered_map<std::string, llvm::Type*> sretTypes;
   /// Coroutine data, if current function is a coroutine
   CoroData coro;
   /// Loop data stack, containing break/continue blocks
